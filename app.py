@@ -16,8 +16,9 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ====== ENV ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # BotFather token
-BASE_URL  = os.getenv("BASE_URL")   # e.g. https://fordlogo-bot.onrender.com
+BOT_TOKEN = os.getenv("BOT_TOKEN")                          # BotFather token
+BASE_URL  = os.getenv("BASE_URL")                           # e.g. https://fordlogo-bot.onrender.com
+CREATOR   = os.getenv("CREATOR_NAME", "basemessiah @pndmedia")
 
 # Crypto donation addresses (Solana)
 WALLETS = {
@@ -33,9 +34,8 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 USAGE_FILE = DATA_DIR / "usage.json"     # persists per-user usage counts
-CREATOR = os.getenv("CREATOR_NAME", "basemessiah")  # change if you want
 
-# Rename: watermarks are now "white" and "black"
+# Watermarks (filenames are case-sensitive on Linux)
 WATERMARKS = {
     "white": ASSETS / "white.png",
     "black": ASSETS / "black.png",
@@ -44,6 +44,9 @@ WATERMARKS = {
 IMG_MAX = 2 * 1024 * 1024     # 2 MB
 VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
+
+# Visual tuning
+SCALE = 0.70  # logo card width ~= 70% of image/video width (adjust 0.65–0.85 to taste)
 
 # job store (per upload, expires)
 # PENDING[job_id] = { user_id, type, src, ts, logo, pos, opacity }
@@ -121,56 +124,108 @@ def compute_xy_for_position(img_w, img_h, logo_w, logo_h, pos_key: str, margin=2
     y = max(0, y)
     return x, y
 
+def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
+    """
+    Returns a temp PNG path containing the watermark rendered onto a padded
+    high-contrast background card:
+      - black logo -> white background
+      - white logo -> black background
+    The logo alpha is adjusted to 'opacity_pct' while the background stays opaque.
+    """
+    # open and resize the logo
+    logo = Image.open(ensure_logo(wm_key)).convert("RGBA")
+    ratio = target_w / max(1, logo.width)
+    resized = logo.resize((target_w, max(1, int(logo.height * ratio))), resample=Image.LANCZOS)
+
+    # apply opacity to the *logo* (keep background opaque)
+    alpha_val = percent_to_alpha255(opacity_pct)
+    r, g, b, a = resized.split()
+    a = a.point(lambda i: alpha_val if i > 0 else 0)
+    wm = Image.merge("RGBA", (r, g, b, a))
+
+    # choose card background by watermark color
+    if wm_key == "black":
+        bg_rgb = (255, 255, 255)  # white bg
+    else:  # "white"
+        bg_rgb = (0, 0, 0)        # black bg
+
+    # padding ~2% of target width (at least 6px)
+    pad = max(6, target_w // 50)
+    card_w = wm.width + pad * 2
+    card_h = wm.height + pad * 2
+
+    card = Image.new("RGBA", (card_w, card_h), bg_rgb + (255,))  # opaque background
+    card.alpha_composite(wm, (pad, pad))
+
+    # write to temp file
+    out_path = Path("/tmp") / f"wmcard_{uuid.uuid4().hex}.png"
+    card.save(out_path, format="PNG")
+    return out_path
+
 def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
     im = Image.open(src_path).convert("RGBA")
-    logo = Image.open(ensure_logo(wm_key)).convert("RGBA")
 
-    # Scale logo to ~90% of image width (very visible), cap to image width
-    target_w = max(1, int(im.width * 0.90))
-    ratio = target_w / logo.width
-    logo = logo.resize((target_w, max(1, int(logo.height * ratio))), resample=Image.LANCZOS)
+    # scale card to ~SCALE of image width
+    target_w = max(1, int(im.width * SCALE))
+    card_path = build_logo_card(wm_key, target_w, opacity_pct)
+    try:
+        card = Image.open(card_path).convert("RGBA")
 
-    # apply opacity
-    alpha_val = percent_to_alpha255(opacity_pct)
-    r, g, b, a = logo.split()
-    a = a.point(lambda i: alpha_val if i > 0 else 0)
-    logo = Image.merge("RGBA", (r, g, b, a))
+        # position (top/mid/bot)
+        x, y = compute_xy_for_position(im.width, im.height, card.width, card.height, pos_key)
 
-    # position (top/mid/bot)
-    x, y = compute_xy_for_position(im.width, im.height, logo.width, logo.height, pos_key)
-
-    base = Image.new("RGBA", im.size)
-    base = Image.alpha_composite(base, im)
-    base.alpha_composite(logo, (x, y))
-    base.convert("RGB").save(dst_path, quality=92)
+        base = Image.new("RGBA", im.size)
+        base = Image.alpha_composite(base, im)
+        base.alpha_composite(card, (x, y))
+        base.convert("RGB").save(dst_path, quality=92)
+    finally:
+        try: Path(card_path).unlink(missing_ok=True)
+        except: pass
 
 def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
-    logo_path = ensure_logo(wm_key)
-    a = max(0.0, min(1.0, opacity_pct / 100.0))  # 0..1
-    # Scale logo to 90% of video width; position top/mid/bot with 20px margin for top/bot
+    # Get video width (ffprobe)
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width", "-of", "csv=p=0", str(src_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
+        )
+        vid_w = int(probe.stdout.strip() or "0")
+    except Exception:
+        vid_w = 0
+
+    # fallback if probe fails
+    target_w = max(320, int(vid_w * SCALE)) if vid_w > 0 else 640
+
+    # build a watermark card PNG (logo + solid bg + padding)
+    card_path = build_logo_card(wm_key, target_w, opacity_pct)
+
+    # vertical placement
     if pos_key == "top":
         overlay_y = "20"
     elif pos_key == "mid":
         overlay_y = "(main_h-overlay_h)/2"
-    else:  # bot
+    else:
         overlay_y = "main_h-overlay_h-20"
 
-    vf = (
-        "[1][0]scale2ref=w=iw*0.90:h=oh*0.90[wm][v];"
-        f"[wm]format=rgba,colorchannelmixer=aa={a:.2f}[wmf];"
-        f"[v][wmf]overlay=(main_w-overlay_w)/2:{overlay_y}"
-    )
+    # Card already has alpha baked in; just overlay.
+    vf = f"[0][1]overlay=(main_w-overlay_w)/2:{overlay_y}"
+
     cmd = [
         "ffmpeg","-y",
         "-i", str(src_path),
-        "-i", str(logo_path),
+        "-i", str(card_path),
         "-filter_complex", vf,
         "-c:v","libx264","-preset","veryfast","-crf","23",
         "-c:a","copy",
         "-movflags","+faststart",
         str(dst_path)
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finally:
+        try: Path(card_path).unlink(missing_ok=True)
+        except: pass
 
 def qr_image_bytes(payload: str) -> BytesIO:
     qr = qrcode.QRCode(version=1, box_size=10, border=2)
@@ -190,7 +245,6 @@ async def maybe_thank_and_prompt_donate(chat_id: int, user_id: int):
     # After 3rd successful use (and every 5 after), nudge gently
     n = USAGE[uid]
     if n == 3 or (n > 3 and (n % 5 == 0)):
-        # Build donate menu if wallets present
         if WALLETS:
             rows = [[InlineKeyboardButton(text=coin, callback_data=f"donate:{coin}")] for coin in WALLETS.keys()]
             kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -233,7 +287,7 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
             await bot.send_video(chat_id=chat_id, video=FSInputFile(dst), caption="✅ Watermarked")
         # Nudge after success
         await maybe_thank_and_prompt_donate(chat_id, job["user_id"])
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         if msg_to_edit: await msg_to_edit.edit_text("FFmpeg failed on this video. Try a smaller/standard MP4.")
     except Exception as e:
         if msg_to_edit: await msg_to_edit.edit_text(f"Processing error: {e}")
@@ -257,7 +311,7 @@ async def on_start(msg: Message):
         "2) Choose watermark color: **White** or **Black**.\n"
         "3) Choose position: **Top / Middle / Bottom**.\n"
         "4) Choose opacity (40/60/80% or Custom number).\n"
-        "→ I’ll return the watermarked file (logo scaled across the width).\n\n"
+        "→ I’ll return the watermarked file (wide, high-contrast strip for visibility).\n\n"
         "💸 Use /donate to support.  ℹ️ /help for tips.  👤 /about for credits.",
         parse_mode="Markdown"
     )
@@ -267,8 +321,8 @@ async def on_help(msg: Message):
     await msg.answer(
         "Tips:\n"
         "• If the logo looks too faint or too strong, pick a different opacity or type a number like 65.\n"
-        "• If the result fails on video, try smaller size or MP4.\n"
-        "• Watermark is scaled to ~90% of the width for visibility.\n"
+        "• If video fails, try smaller size or MP4.\n"
+        f"• Watermark width is ~{int(SCALE*100)}% of media width for visibility.\n"
         "Commands: /start /help /donate /about"
     )
 
@@ -305,7 +359,7 @@ async def on_donate_coin(cb: CallbackQuery):
             caption=f"**{coin} Donation**\n`{addr}`\n\n• Network: Solana (SPL for USDT)\n• Scan the QR or copy the address.",
             parse_mode="Markdown"
         )
-    except Exception as e:
+    except Exception:
         await bot.send_message(
             chat_id=cb.message.chat.id,
             text=f"**{coin} Donation**\n`{addr}`\n\n(If QR failed to load, copy the address above.)",
