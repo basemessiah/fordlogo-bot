@@ -19,7 +19,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 BOT_TOKEN  = os.getenv("BOT_TOKEN")
 BASE_URL   = os.getenv("BASE_URL")
 CREATOR    = os.getenv("CREATOR_NAME", "basemessiah @pndmedia")
-ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))  # your Telegram numeric ID
+ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))  # set to YOUR numeric Telegram user id
 
 # Donation wallets (Solana)
 WALLETS = {
@@ -45,11 +45,11 @@ IMG_MAX = 2 * 1024 * 1024     # 2 MB
 VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
 
-# ====== VISUAL (fit like your example) ======
+# ====== VISUAL ======
 FIT_PCT       = float(os.getenv("FIT_PCT", "0.65"))   # watermark width as % of media width
 ALLOW_UPSCALE = os.getenv("ALLOW_UPSCALE", "true").lower() in ("1","true","yes")
 VERT_MARGIN   = int(os.getenv("VERT_MARGIN", "20"))   # px from top/bottom
-MASK_ALPHA    = float(os.getenv("MASK_ALPHA", "0.35"))  # 0..1 for translucent mask
+MASK_ALPHA    = float(os.getenv("MASK_ALPHA", "0.35"))  # 0..1 translucency of mask
 
 # ====== STATE ======
 PENDING = {}           # job_id -> {user_id,type,src,ts,logo,pos}
@@ -109,7 +109,7 @@ def percent_to_alpha255(p: float) -> int:
     p = max(0.0, min(1.0, p))
     return int(round(255 * p))
 
-# ====== CARD BUILDER (logo + translucent mask behind it) ======
+# ====== CARD (logo + translucent mask behind for readability) ======
 def build_card_scaled(logo_path: Path, target_w: int, logo_key: str) -> Path:
     """
     Resize the logo to target_w (optionally upscaling), draw a translucent mask
@@ -126,19 +126,15 @@ def build_card_scaled(logo_path: Path, target_w: int, logo_key: str) -> Path:
     new_h = max(1, int(logo.height * ratio))
     wm = logo.resize((new_w, new_h), resample=Image.LANCZOS)
 
-    # Build card with mask background (same size as logo)
     card = Image.new("RGBA", (new_w, new_h), (0,0,0,0))
-
     if logo_key == "black":
-        # white translucent mask
         mask_color = (255, 255, 255, percent_to_alpha255(MASK_ALPHA))
     else:  # "white"
-        # black translucent mask
         mask_color = (0, 0, 0, percent_to_alpha255(MASK_ALPHA))
 
     mask_layer = Image.new("RGBA", (new_w, new_h), mask_color)
     card.alpha_composite(mask_layer, (0,0))
-    card.alpha_composite(wm, (0,0))  # crisp logo on top
+    card.alpha_composite(wm, (0,0))
 
     out = Path("/tmp") / f"card_{uuid.uuid4().hex}.png"
     card.save(out, "PNG")
@@ -146,24 +142,20 @@ def build_card_scaled(logo_path: Path, target_w: int, logo_key: str) -> Path:
 
 # ====== IMAGE PROCESS ======
 def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, pos_key: str):
-    # Work in RGBA and export PNG to keep quality
     base = Image.open(src_path).convert("RGBA")
-
     target_w = max(1, int(base.width * FIT_PCT))
     card_path = build_card_scaled(ensure_logo(wm_key), target_w, wm_key)
     try:
         card = Image.open(card_path).convert("RGBA")
         x, y = compute_xy_for_position(base.width, base.height, card.width, card.height, pos_key)
-
         canvas = Image.new("RGBA", base.size)
         canvas = Image.alpha_composite(canvas, base)
         canvas.alpha_composite(card, (x, y))
-        # Save PNG (lossless) to avoid quality drop
-        canvas.save(dst_path, "PNG")
+        canvas.save(dst_path, "PNG")  # lossless
     finally:
         Path(card_path).unlink(missing_ok=True)
 
-# ====== VIDEO PROCESS (ffmpeg overlay card) ======
+# ====== VIDEO PROCESS ======
 def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, pos_key: str):
     # probe width
     try:
@@ -193,7 +185,6 @@ def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, pos_key: s
         "-i", str(src_path),
         "-i", str(card_path),
         "-filter_complex", vf,
-        # Higher quality encode to preserve overall sharpness
         "-c:v","libx264","-preset","medium","-crf","20",
         "-c:a","copy",
         "-pix_fmt","yuv420p",
@@ -212,51 +203,8 @@ def qr_image_bytes(payload: str) -> BytesIO:
     img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0); return buf
 
-async def maybe_thank_and_prompt_donate(chat_id: int, user_id: int):
-    uid = str(user_id)
-    USAGE[uid] = USAGE.get(uid, 0) + 1
-    save_usage(USAGE)
-    n = USAGE[uid]
-    if n == 3 or (n > 3 and (n % 5 == 0)):
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=coin, callback_data=f"donate:{coin}")]
-            for coin in WALLETS.keys()
-        ]) if WALLETS else None
-        text = ("🙏 Looks like you’re enjoying the bot! If it helps, consider a small donation."
-                " Tap a coin below to get the address/QR.") if WALLETS else "🙏 Enjoying the bot? A small donation helps."
-        await bot.send_message(chat_id, text, reply_markup=kb)
-
-# ====== BOT ======
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher()
-
-@dp.message(Command("start"))
-async def on_start(msg: Message):
-    pct = int(FIT_PCT * 100)
-    await msg.answer(
-        "Welcome to $Ford Logo Bot 👋\n\n"
-        "📌 *How to use*\n"
-        "1) Send an *image (≤2MB)* or *video (≤20MB)*.\n"
-        "2) Choose watermark color: **White** or **Black**.\n"
-        "3) Choose position: **Top / Middle / Bottom**.\n"
-        f"→ I’ll place the logo at ~{pct}% width with a subtle contrast mask for readability.\n\n"
-        "💸 /donate  ℹ️ /help  👤 /about  📊 /stats",
-        parse_mode="Markdown"
-    )
-
-@dp.message(Command("help"))
-async def on_help(msg: Message):
-    pct = int(FIT_PCT * 100)
-    await msg.answer(
-        f"Watermark width ≈ {pct}% of media (change with env `FIT_PCT`, e.g., 0.70).\n"
-        f"Visibility mask opacity is set by `MASK_ALPHA` (default {MASK_ALPHA}).\n"
-        "Images are returned as PNG (lossless). Videos use CRF 20 for good quality.\n"
-        "Commands: /start /help /donate /about"
-    )
-
-@dp.message(Command("about"))
-async def on_about(msg: Message):
-    await msg.answer(f"Built with ❤️ by **{CREATOR}**.", parse_mode="Markdown")
 
 @dp.message(Command("donate"))
 async def on_donate(msg: Message):
@@ -270,20 +218,73 @@ async def on_donate(msg: Message):
 
 @dp.callback_query(F.data.startswith("donate:"))
 async def on_donate_coin(cb: CallbackQuery):
+    # NOTE: Bots cannot copy to clipboard automatically.
+    # We send the address in a monospace block + QR, then notify.
     coin = cb.data.split(":", 1)[1]
     addr = WALLETS.get(coin)
     if not addr: await cb.answer("Unavailable", show_alert=True); return
-    uri = f"solana:{addr}" if coin == "SOL" else addr
-    png = qr_image_bytes(uri)
-    await bot.send_photo(
-        chat_id=cb.message.chat.id,
-        photo=InputFile(png, filename=f"{coin.replace(' ','_')}.png"),
-        caption=f"**{coin} Donation**\n`{addr}`\n\n• Network: Solana (SPL for USDT)",
-        parse_mode="Markdown"
+
+    caption = (
+        f"**{coin} Address**\n"
+        f"`{addr}`\n\n"
+        "👉 Long-press to copy, then send your donation to this address.\n"
+        "_Thank you for supporting the bot!_"
     )
-    await cb.answer()
+    try:
+        png = qr_image_bytes(addr if coin != "SOL" else f"solana:{addr}")
+        await bot.send_photo(
+            chat_id=cb.message.chat.id,
+            photo=InputFile(png, filename=f"{coin.replace(' ','_')}.png"),
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await bot.send_message(cb.message.chat.id, caption, parse_mode="Markdown")
+
+    await cb.answer("Address sent — please donate to the address I just sent.", show_alert=False)
+
+# ====== HOW TO USE ======
+@dp.message(Command("start"))
+async def on_start(msg: Message):
+    await msg.answer(
+        "Welcome to $Ford Logo Bot 👋\n\n"
+        "How to use:\n"
+        "1) Send an image (≤2MB) or video (≤20MB).\n"
+        "2) Choose watermark color: White or Black.\n"
+        "3) Choose position: Top / Middle / Bottom.\n"
+        "✅ I’ll place the logo at ~65% of the width with a subtle contrast mask so it’s readable.\n\n"
+        "Need to support the bot? Use /donate",
+    )
+
+@dp.message(Command("help"))
+async def on_help(msg: Message):
+    await msg.answer(
+        "How to use:\n"
+        "• Send an image (≤2MB) or video (≤20MB).\n"
+        "• Pick White or Black.\n"
+        "• Pick Top / Middle / Bottom.\n"
+        "• I’ll return the watermarked result.\n\n"
+        "For tips & support: /donate"
+    )
+
+@dp.message(Command("about"))
+async def on_about(msg: Message):
+    await msg.answer(f"Built with ❤️ by {CREATOR}.")
+
+# Quick helper to get YOUR numeric ID so you can set ADMIN_ID
+@dp.message(Command("whoami"))
+async def on_whoami(msg: Message):
+    await msg.answer(f"Your Telegram numeric ID is: `{msg.from_user.id}`\n"
+                     "Set this in Render → Environment as `ADMIN_ID` and redeploy.",
+                     parse_mode="Markdown")
 
 # ====== FILE HANDLERS ======
+def job_opacity_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    # (opacity removed by request; keep stub if needed in future)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Cancel", callback_data=f"job:{job_id}:cancel")],
+    ])
+
 @dp.message( (F.photo) | (F.document & F.document.mime_type.startswith("image/")) )
 async def handle_image(msg: Message):
     cleanup_old_jobs()
@@ -312,7 +313,6 @@ async def handle_video(msg: Message):
                        "logo": None, "pos": None}
     await msg.reply("Choose watermark color:", reply_markup=job_logo_keyboard(job_id))
 
-# Position flow
 @dp.callback_query(F.data.startswith("job:"))
 async def on_job_callback(cb: CallbackQuery):
     parts = cb.data.split(":")
@@ -347,7 +347,6 @@ async def on_job_callback(cb: CallbackQuery):
         if val not in ("top","mid","bot"):
             await cb.answer("Unknown position.", show_alert=True); return
         job["pos"] = val
-        # Process immediately (no opacity step anymore)
         await cb.message.edit_text("⏳ Processing…")
         await process_and_send(bot, cb.message.chat.id, job_id, msg_to_edit=cb.message)
         await cb.answer(); return
@@ -377,7 +376,8 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
         else:
             ffmpeg_overlay_video(src, dst, job["logo"], job["pos"])
             await bot.send_video(chat_id, FSInputFile(dst), caption="✅ Watermarked")
-        # usage + donation nudge
+
+        # persist usage; small donation nudge sometimes
         uid = job["user_id"]
         USAGE[str(uid)] = USAGE.get(str(uid), 0) + 1
         save_usage(USAGE)
@@ -388,7 +388,8 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
                     [InlineKeyboardButton(text=coin, callback_data=f"donate:{coin}")]
                     for coin in WALLETS.keys()
                 ])
-                await bot.send_message(chat_id, "🙏 If this bot helps, consider a small donation.", reply_markup=kb)
+                await bot.send_message(chat_id, "🙏 Enjoying the bot? Consider a small donation.", reply_markup=kb)
+
     except subprocess.CalledProcessError:
         if msg_to_edit: await msg_to_edit.edit_text("FFmpeg failed. Try a smaller/standard MP4.")
     except Exception as e:
@@ -404,7 +405,8 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
 @dp.message(Command("stats"))
 async def on_stats(msg: Message):
     if ADMIN_ID and msg.from_user.id == ADMIN_ID:
-        total_users = len(USAGE); total_jobs = sum(USAGE.values())
+        total_users = len(USAGE)
+        total_jobs = sum(USAGE.values())
         top = sorted(USAGE.items(), key=lambda x: x[1], reverse=True)[:5]
         lines = [f"📊 Bot Stats", f"Users: {total_users}", f"Total Jobs: {total_jobs}", "Top users:"]
         for uid, cnt in top: lines.append(f"- {uid}: {cnt}")
