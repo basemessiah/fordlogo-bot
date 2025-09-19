@@ -16,9 +16,12 @@ from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ====== ENV ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")                          # BotFather token
-BASE_URL  = os.getenv("BASE_URL")                           # e.g. https://fordlogo-bot.onrender.com
-CREATOR   = os.getenv("CREATOR_NAME", "basemessiah @pndmedia")
+BOT_TOKEN  = os.getenv("BOT_TOKEN")                          # BotFather token
+BASE_URL   = os.getenv("BASE_URL")                           # e.g. https://fordlogo-bot.onrender.com
+CREATOR    = os.getenv("CREATOR_NAME", "basemessiah @pndmedia")
+
+# Admin for stats
+ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))                 # set to your Telegram numeric ID
 
 # Crypto donation addresses (Solana)
 WALLETS = {
@@ -46,7 +49,8 @@ VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
 
 # Visual tuning
-SCALE = 0.70  # logo card width ~= 70% of image/video width (adjust 0.65–0.85 to taste)
+SCALE = float(os.getenv("SCALE", "0.70"))  # card width ~= 70% of media width
+ALLOW_UPSCALE = os.getenv("ALLOW_UPSCALE", "true").lower() in ("1", "true", "yes")
 
 # job store (per upload, expires)
 # PENDING[job_id] = { user_id, type, src, ts, logo, pos, opacity }
@@ -124,7 +128,7 @@ def compute_xy_for_position(img_w, img_h, logo_w, logo_h, pos_key: str, margin=2
     y = max(0, y)
     return x, y
 
-def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
+def build_logo_card_from_png(logo_path: Path, wm_key: str, target_w: int, opacity_pct: float) -> Path:
     """
     Returns a temp PNG path containing the watermark rendered onto a padded
     high-contrast background card:
@@ -132,10 +136,15 @@ def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
       - white logo -> black background
     The logo alpha is adjusted to 'opacity_pct' while the background stays opaque.
     """
-    # open and resize the logo
-    logo = Image.open(ensure_logo(wm_key)).convert("RGBA")
+    # open logo
+    logo = Image.open(logo_path).convert("RGBA")
+
+    # prevent upscaling if ALLOW_UPSCALE is False
+    if not ALLOW_UPSCALE:
+        target_w = min(target_w, logo.width)
+
     ratio = target_w / max(1, logo.width)
-    resized = logo.resize((target_w, max(1, int(logo.height * ratio))), resample=Image.LANCZOS)
+    resized = logo.resize((max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))), resample=Image.LANCZOS)
 
     # apply opacity to the *logo* (keep background opaque)
     alpha_val = percent_to_alpha255(opacity_pct)
@@ -161,6 +170,10 @@ def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
     out_path = Path("/tmp") / f"wmcard_{uuid.uuid4().hex}.png"
     card.save(out_path, format="PNG")
     return out_path
+
+def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
+    """Wrapper to choose the right asset and build a card PNG."""
+    return build_logo_card_from_png(ensure_logo(wm_key), wm_key, target_w, opacity_pct)
 
 def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
     im = Image.open(src_path).convert("RGBA")
@@ -311,18 +324,20 @@ async def on_start(msg: Message):
         "2) Choose watermark color: **White** or **Black**.\n"
         "3) Choose position: **Top / Middle / Bottom**.\n"
         "4) Choose opacity (40/60/80% or Custom number).\n"
-        "→ I’ll return the watermarked file (wide, high-contrast strip for visibility).\n\n"
-        "💸 Use /donate to support.  ℹ️ /help for tips.  👤 /about for credits.",
+        "→ I’ll return the watermarked file with a wide, high-contrast strip for visibility.\n\n"
+        "💸 /donate  ℹ️ /help  👤 /about  📊 /stats (admin)",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("help"))
 async def on_help(msg: Message):
+    pct = int(SCALE * 100)
+    upscale_note = " (no upscaling)" if not ALLOW_UPSCALE else ""
     await msg.answer(
         "Tips:\n"
+        f"• Watermark width ≈ {pct}% of media{upscale_note}. Set env SCALE to tune.\n"
         "• If the logo looks too faint or too strong, pick a different opacity or type a number like 65.\n"
         "• If video fails, try smaller size or MP4.\n"
-        f"• Watermark width is ~{int(SCALE*100)}% of media width for visibility.\n"
         "Commands: /start /help /donate /about"
     )
 
@@ -478,6 +493,33 @@ async def on_text(msg: Message):
     job["opacity"] = float(val)
     WAITING.pop(msg.from_user.id, None)
     await process_and_send(bot, msg.chat.id, job_id)
+
+# ====== ADMIN: stats & export ======
+@dp.message(Command("stats"))
+async def on_stats(msg: Message):
+    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
+        total_users = len(USAGE)
+        total_jobs = sum(USAGE.values())
+        top_users = sorted(USAGE.items(), key=lambda x: x[1], reverse=True)[:5]
+        lines = [f"📊 Bot Stats",
+                 f"Users: {total_users}",
+                 f"Total Jobs: {total_jobs}",
+                 "Top users:"]
+        for uid, cnt in top_users:
+            lines.append(f"- {uid}: {cnt}")
+        await msg.answer("\n".join(lines))
+    else:
+        await msg.answer("⛔ You are not allowed to view stats.")
+
+@dp.message(Command("exportstats"))
+async def on_exportstats(msg: Message):
+    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
+        # ensure file exists
+        if not USAGE_FILE.exists():
+            USAGE_FILE.write_text(json.dumps(USAGE))
+        await bot.send_document(msg.chat.id, document=FSInputFile(USAGE_FILE), caption="usage.json")
+    else:
+        await msg.answer("⛔ You are not allowed to export stats.")
 
 # ====== WEBHOOK SERVER ======
 async def on_startup(app: web.Application):
