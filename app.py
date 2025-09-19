@@ -47,11 +47,8 @@ IMG_MAX = 2 * 1024 * 1024     # 2 MB
 VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
 
-# ==== VISUAL TUNING ====
-# Make the watermark span the width: 0.98 = 98% of media width
-SCALE = float(os.getenv("SCALE", "0.98"))
-# Keep this TRUE to always stretch across even if source PNG is small
-ALLOW_UPSCALE = os.getenv("ALLOW_UPSCALE", "true").lower() in ("1", "true", "yes")
+# No scaling mode — always use the PNG as-is
+# (SCALE/ALLOW_UPSCALE are ignored intentionally)
 
 # job store (per upload, expires)
 # PENDING[job_id] = { user_id, type, src, ts, logo, pos, opacity }
@@ -119,35 +116,28 @@ def percent_to_alpha255(pct: float) -> int:
     return int(round(255 * (pct / 100.0)))
 
 def compute_xy_for_position(img_w, img_h, wm_w, wm_h, pos_key: str, margin=20):
-    x = (img_w - wm_w) // 2
+    """
+    Center horizontally (x). For y: top/middle/bottom with a small margin.
+    """
+    x = max(0, (img_w - wm_w) // 2)
     if pos_key == "top":
         y = margin
     elif pos_key == "mid":
-        y = (img_h - wm_h) // 2
+        y = max(0, (img_h - wm_h) // 2)
     else:  # "bot"
-        y = img_h - wm_h - margin
-    y = max(0, y)
+        y = max(0, img_h - wm_h - margin)
     return x, y
 
-# ====== WATERMARKING (no background strip) ======
-def build_logo(logo_path: Path, target_w: int, opacity_pct: float) -> Path:
+# ====== WATERMARKING (no scaling) ======
+def build_logo_no_scale(logo_path: Path, opacity_pct: float) -> Path:
     """
-    Returns a temp PNG path of the resized logo with desired opacity (no background).
+    Returns a temp PNG path of the original logo with desired opacity (no resizing).
     """
     logo = Image.open(logo_path).convert("RGBA")
-    if not ALLOW_UPSCALE:
-        target_w = min(target_w, logo.width)
-    ratio = target_w / max(1, logo.width)
-    resized = logo.resize(
-        (max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))),
-        resample=Image.LANCZOS
-    )
-
     alpha_val = percent_to_alpha255(opacity_pct)
-    r, g, b, a = resized.split()
+    r, g, b, a = logo.split()
     a = a.point(lambda i: alpha_val if i > 0 else 0)
     wm = Image.merge("RGBA", (r, g, b, a))
-
     out = Path("/tmp") / f"wm_{uuid.uuid4().hex}.png"
     wm.save(out, "PNG")
     return out
@@ -155,11 +145,12 @@ def build_logo(logo_path: Path, target_w: int, opacity_pct: float) -> Path:
 def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
     im = Image.open(src_path).convert("RGBA")
 
-    # the logo spans ~SCALE of image width
-    target_w = max(1, int(im.width * SCALE))
-    wm_path = build_logo(ensure_logo(wm_key), target_w, opacity_pct)
+    # Use watermark as-is
+    wm_path = build_logo_no_scale(ensure_logo(wm_key), opacity_pct)
     try:
         wm = Image.open(wm_path).convert("RGBA")
+
+        # If watermark is larger than the base image, it will be clipped naturally.
         x, y = compute_xy_for_position(im.width, im.height, wm.width, wm.height, pos_key)
 
         base = Image.new("RGBA", im.size)
@@ -170,22 +161,10 @@ def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_
         Path(wm_path).unlink(missing_ok=True)
 
 def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
-    # Get video width (ffprobe)
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width", "-of", "csv=p=0", str(src_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
-        )
-        vid_w = int(probe.stdout.strip() or "0")
-    except Exception:
-        vid_w = 0
+    # Build logo PNG as-is (no scaling)
+    wm_path = build_logo_no_scale(ensure_logo(wm_key), opacity_pct)
 
-    # fallback if probe fails
-    target_w = max(320, int(vid_w * SCALE)) if vid_w > 0 else 640
-
-    wm_path = build_logo(ensure_logo(wm_key), target_w, opacity_pct)
-
+    # We need to know overlay_y; center X is handled by expression
     if pos_key == "top":
         overlay_y = "20"
     elif pos_key == "mid":
@@ -246,7 +225,6 @@ dp  = Dispatcher()
 # ----- Commands -----
 @dp.message(Command("start"))
 async def on_start(msg: Message):
-    pct = int(SCALE * 100)
     await msg.answer(
         "Welcome to $Ford Logo Bot 👋\n\n"
         "📌 *How to use*\n"
@@ -254,18 +232,16 @@ async def on_start(msg: Message):
         "2) Choose watermark color: **White** or **Black**.\n"
         "3) Choose position: **Top / Middle / Bottom**.\n"
         "4) Choose opacity (40/60/80% or Custom number).\n"
-        f"→ I’ll return the watermarked file spanning ~{pct}% of the width (no background box).\n\n"
+        "→ I’ll place the logo *as-is* (no stretching), centered at your chosen position.\n\n"
         "💸 /donate  ℹ️ /help  👤 /about  📊 /stats (admin)",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("help"))
 async def on_help(msg: Message):
-    pct = int(SCALE * 100)
-    upscale_note = " (always stretches across)" if ALLOW_UPSCALE else " (no upscaling)"
     await msg.answer(
         "Tips:\n"
-        f"• Watermark width ≈ {pct}% of media{upscale_note}. Set env SCALE to tune.\n"
+        "• Logo is used *as-is* (original PNG size). If it looks too big/small, replace the PNG in assets.\n"
         "• If the logo looks too faint or too strong, pick a different opacity or type a number like 65.\n"
         "• If video fails, try smaller size or MP4.\n"
         "Commands: /start /help /donate /about"
@@ -339,6 +315,15 @@ async def handle_video(msg: Message):
     await msg.reply("Choose watermark color:", reply_markup=job_logo_keyboard(job_id))
 
 # ----- Job flow callbacks -----
+def job_opacity_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="40%", callback_data=f"job:{job_id}:op:40"),
+         InlineKeyboardButton(text="60%", callback_data=f"job:{job_id}:op:60"),
+         InlineKeyboardButton(text="80%", callback_data=f"job:{job_id}:op:80")],
+        [InlineKeyboardButton(text="Custom…", callback_data=f"job:{job_id}:op:custom")],
+        [InlineKeyboardButton(text="Cancel", callback_data=f"job:{job_id}:cancel")],
+    ])
+
 @dp.callback_query(F.data.startswith("job:"))
 async def on_job_callback(cb: CallbackQuery):
     parts = cb.data.split(":")
@@ -418,32 +403,6 @@ async def on_text(msg: Message):
     WAITING.pop(msg.from_user.id, None)
     await process_and_send(bot, msg.chat.id, job_id)
 
-# ====== ADMIN: stats & export ======
-@dp.message(Command("stats"))
-async def on_stats(msg: Message):
-    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
-        total_users = len(USAGE)
-        total_jobs = sum(USAGE.values())
-        top_users = sorted(USAGE.items(), key=lambda x: x[1], reverse=True)[:5]
-        lines = [f"📊 Bot Stats",
-                 f"Users: {total_users}",
-                 f"Total Jobs: {total_jobs}",
-                 "Top users:"]
-        for uid, cnt in top_users:
-            lines.append(f"- {uid}: {cnt}")
-        await msg.answer("\n".join(lines))
-    else:
-        await msg.answer("⛔ You are not allowed to view stats.")
-
-@dp.message(Command("exportstats"))
-async def on_exportstats(msg: Message):
-    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
-        if not USAGE_FILE.exists():
-            USAGE_FILE.write_text(json.dumps(USAGE))
-        await bot.send_document(msg.chat.id, document=FSInputFile(USAGE_FILE), caption="usage.json")
-    else:
-        await msg.answer("⛔ You are not allowed to export stats.")
-
 # ====== PROCESSOR ======
 async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Optional[Message] = None):
     job = PENDING.get(job_id)
@@ -485,6 +444,32 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
             Path(dst).unlink(missing_ok=True)
         except: pass
         PENDING.pop(job_id, None)
+
+# ====== ADMIN: stats & export ======
+@dp.message(Command("stats"))
+async def on_stats(msg: Message):
+    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
+        total_users = len(USAGE)
+        total_jobs = sum(USAGE.values())
+        top_users = sorted(USAGE.items(), key=lambda x: x[1], reverse=True)[:5]
+        lines = [f"📊 Bot Stats",
+                 f"Users: {total_users}",
+                 f"Total Jobs: {total_jobs}",
+                 "Top users:"]
+        for uid, cnt in top_users:
+            lines.append(f"- {uid}: {cnt}")
+        await msg.answer("\n".join(lines))
+    else:
+        await msg.answer("⛔ You are not allowed to view stats.")
+
+@dp.message(Command("exportstats"))
+async def on_exportstats(msg: Message):
+    if ADMIN_ID and msg.from_user.id == ADMIN_ID:
+        if not USAGE_FILE.exists():
+            USAGE_FILE.write_text(json.dumps(USAGE))
+        await bot.send_document(msg.chat.id, document=FSInputFile(USAGE_FILE), caption="usage.json")
+    else:
+        await msg.answer("⛔ You are not allowed to export stats.")
 
 # ====== WEBHOOK SERVER ======
 async def on_startup(app: web.Application):
