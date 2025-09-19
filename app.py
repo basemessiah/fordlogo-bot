@@ -48,9 +48,14 @@ IMG_MAX = 2 * 1024 * 1024     # 2 MB
 VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
 
-# Visual tuning
-SCALE = float(os.getenv("SCALE", "0.70"))  # card width ~= 70% of media width
+# ==== VISUAL TUNING ====
+# Make the watermark span the width: 0.98 = 98% of media width (tiny side padding)
+SCALE = float(os.getenv("SCALE", "0.98"))
+# Keep this TRUE to always stretch across even if source PNG is small
 ALLOW_UPSCALE = os.getenv("ALLOW_UPSCALE", "true").lower() in ("1", "true", "yes")
+# Padding around the logo inside the strip (as % of target width); 0.02 ≈ 2%
+PAD_FRAC = float(os.getenv("PAD_FRAC", "0.02"))
+MIN_PAD = 6  # px
 
 # job store (per upload, expires)
 # PENDING[job_id] = { user_id, type, src, ts, logo, pos, opacity }
@@ -131,18 +136,19 @@ def compute_xy_for_position(img_w, img_h, logo_w, logo_h, pos_key: str, margin=2
 def build_logo_card_from_png(logo_path: Path, wm_key: str, target_w: int, opacity_pct: float) -> Path:
     """
     Returns a temp PNG path containing the watermark rendered onto a padded
-    high-contrast background card:
+    high-contrast background card that spans ~target_w width:
       - black logo -> white background
       - white logo -> black background
-    The logo alpha is adjusted to 'opacity_pct' while the background stays opaque.
+    The *logo* alpha is adjusted to 'opacity_pct'; the background stays opaque.
     """
     # open logo
     logo = Image.open(logo_path).convert("RGBA")
 
-    # prevent upscaling if ALLOW_UPSCALE is False
+    # optional: prevent upscaling
     if not ALLOW_UPSCALE:
         target_w = min(target_w, logo.width)
 
+    # resize logo to target width
     ratio = target_w / max(1, logo.width)
     resized = logo.resize((max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))), resample=Image.LANCZOS)
 
@@ -158,8 +164,8 @@ def build_logo_card_from_png(logo_path: Path, wm_key: str, target_w: int, opacit
     else:  # "white"
         bg_rgb = (0, 0, 0)        # black bg
 
-    # padding ~2% of target width (at least 6px)
-    pad = max(6, target_w // 50)
+    # padding around the logo
+    pad = max(MIN_PAD, int(target_w * PAD_FRAC))
     card_w = wm.width + pad * 2
     card_h = wm.height + pad * 2
 
@@ -178,7 +184,7 @@ def build_logo_card(wm_key: str, target_w: int, opacity_pct: float) -> Path:
 def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
     im = Image.open(src_path).convert("RGBA")
 
-    # scale card to ~SCALE of image width
+    # card spans ~full width
     target_w = max(1, int(im.width * SCALE))
     card_path = build_logo_card(wm_key, target_w, opacity_pct)
     try:
@@ -221,7 +227,7 @@ def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pc
     else:
         overlay_y = "main_h-overlay_h-20"
 
-    # Card already has alpha baked in; just overlay.
+    # Card already has alpha baked in; just overlay at center X.
     vf = f"[0][1]overlay=(main_w-overlay_w)/2:{overlay_y}"
 
     cmd = [
@@ -317,6 +323,7 @@ dp  = Dispatcher()
 
 @dp.message(Command("start"))
 async def on_start(msg: Message):
+    pct = int(SCALE * 100)
     await msg.answer(
         "Welcome to $Ford Logo Bot 👋\n\n"
         "📌 *How to use*\n"
@@ -324,7 +331,7 @@ async def on_start(msg: Message):
         "2) Choose watermark color: **White** or **Black**.\n"
         "3) Choose position: **Top / Middle / Bottom**.\n"
         "4) Choose opacity (40/60/80% or Custom number).\n"
-        "→ I’ll return the watermarked file with a wide, high-contrast strip for visibility.\n\n"
+        f"→ I’ll return the watermarked file with a wide strip spanning ~{pct}% of the width.\n\n"
         "💸 /donate  ℹ️ /help  👤 /about  📊 /stats (admin)",
         parse_mode="Markdown"
     )
@@ -332,7 +339,7 @@ async def on_start(msg: Message):
 @dp.message(Command("help"))
 async def on_help(msg: Message):
     pct = int(SCALE * 100)
-    upscale_note = " (no upscaling)" if not ALLOW_UPSCALE else ""
+    upscale_note = " (always stretches across)" if ALLOW_UPSCALE else " (no upscaling)"
     await msg.answer(
         "Tips:\n"
         f"• Watermark width ≈ {pct}% of media{upscale_note}. Set env SCALE to tune.\n"
@@ -362,10 +369,8 @@ async def on_donate_coin(cb: CallbackQuery):
     if not addr:
         await cb.answer("Unavailable", show_alert=True); return
 
-    # For SOL we can use a URI; for USDT(Solana) many wallets just need the address QR
     uri = f"solana:{addr}" if coin == "SOL" else addr
 
-    # Try sending QR; fallback to plain text on error
     try:
         png = qr_image_bytes(uri)
         await bot.send_photo(
@@ -514,7 +519,6 @@ async def on_stats(msg: Message):
 @dp.message(Command("exportstats"))
 async def on_exportstats(msg: Message):
     if ADMIN_ID and msg.from_user.id == ADMIN_ID:
-        # ensure file exists
         if not USAGE_FILE.exists():
             USAGE_FILE.write_text(json.dumps(USAGE))
         await bot.send_document(msg.chat.id, document=FSInputFile(USAGE_FILE), caption="usage.json")
