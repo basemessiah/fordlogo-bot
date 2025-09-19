@@ -19,7 +19,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 BOT_TOKEN  = os.getenv("BOT_TOKEN")
 BASE_URL   = os.getenv("BASE_URL")
 CREATOR    = os.getenv("CREATOR_NAME", "basemessiah @pndmedia")
-ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))  # your Telegram numeric ID
 
 # Donation wallets (Solana)
 WALLETS = {
@@ -45,17 +45,18 @@ IMG_MAX = 2 * 1024 * 1024     # 2 MB
 VID_MAX = 20 * 1024 * 1024    # 20 MB
 TMP_DIR = Path("/tmp")
 
-# ====== VISUAL: "fit like the example" ======
-# Target width of the watermark relative to media width (NOT full bleed)
-FIT_PCT = float(os.getenv("FIT_PCT", "0.65"))   # 65% by default
+# ====== VISUAL (fit like your example) ======
+FIT_PCT       = float(os.getenv("FIT_PCT", "0.65"))   # watermark width as % of media width
 ALLOW_UPSCALE = os.getenv("ALLOW_UPSCALE", "true").lower() in ("1","true","yes")
-BOTTOM_MARGIN = int(os.getenv("BOTTOM_MARGIN", "20"))  # px padding from bottom/top
+VERT_MARGIN   = int(os.getenv("VERT_MARGIN", "20"))   # px from top/bottom
+MASK_ALPHA    = float(os.getenv("MASK_ALPHA", "0.35"))  # 0..1 for translucent mask
 
 # ====== STATE ======
-PENDING = {}           # job_id -> {user_id,type,src,ts,logo,pos,opacity}
-WAITING = {}           # user_id -> job_id (for custom opacity prompt)
+PENDING = {}           # job_id -> {user_id,type,src,ts,logo,pos}
 JOB_TTL_SECS = 15*60
+USAGE = {}
 
+# ====== USAGE PERSISTENCE ======
 def load_usage():
     if USAGE_FILE.exists():
         try: return json.loads(USAGE_FILE.read_text())
@@ -94,65 +95,77 @@ def job_position_keyboard(job_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Cancel", callback_data=f"job:{job_id}:cancel")],
     ])
 
-def job_opacity_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="40%", callback_data=f"job:{job_id}:op:40"),
-         InlineKeyboardButton(text="60%", callback_data=f"job:{job_id}:op:60"),
-         InlineKeyboardButton(text="80%", callback_data=f"job:{job_id}:op:80")],
-        [InlineKeyboardButton(text="Custom…", callback_data=f"job:{job_id}:op:custom")],
-        [InlineKeyboardButton(text="Cancel", callback_data=f"job:{job_id}:cancel")],
-    ])
-
-def percent_to_alpha255(pct: float) -> int:
-    return int(round(255 * (max(0.0, min(100.0, pct)) / 100.0)))
-
 def compute_xy_for_position(img_w, img_h, wm_w, wm_h, pos_key: str) -> tuple[int,int]:
     x = max(0, (img_w - wm_w) // 2)
     if pos_key == "top":
-        y = BOTTOM_MARGIN
+        y = VERT_MARGIN
     elif pos_key == "mid":
         y = max(0, (img_h - wm_h)//2)
     else:
-        y = max(0, img_h - wm_h - BOTTOM_MARGIN)
+        y = max(0, img_h - wm_h - VERT_MARGIN)
     return x, y
 
-# ====== WATERMARKING (scaled to a nice "fit") ======
-def build_logo_scaled(logo_path: Path, target_w: int, opacity_pct: float) -> Path:
-    """Resize logo to target_w (optionally upscaling), apply opacity, return temp PNG."""
+def percent_to_alpha255(p: float) -> int:
+    p = max(0.0, min(1.0, p))
+    return int(round(255 * p))
+
+# ====== CARD BUILDER (logo + translucent mask behind it) ======
+def build_card_scaled(logo_path: Path, target_w: int, logo_key: str) -> Path:
+    """
+    Resize the logo to target_w (optionally upscaling), draw a translucent mask
+    rectangle of the same size behind it (white for black logo, black for white logo),
+    and return a PNG with both combined (RGBA).
+    """
     logo = Image.open(logo_path).convert("RGBA")
+
     if not ALLOW_UPSCALE:
         target_w = min(target_w, logo.width)
+
     ratio = target_w / max(1, logo.width)
     new_w = max(1, int(logo.width * ratio))
     new_h = max(1, int(logo.height * ratio))
-    resized = logo.resize((new_w, new_h), resample=Image.LANCZOS)
+    wm = logo.resize((new_w, new_h), resample=Image.LANCZOS)
 
-    alpha_val = percent_to_alpha255(opacity_pct)
-    r,g,b,a = resized.split()
-    a = a.point(lambda i: alpha_val if i > 0 else 0)
-    wm = Image.merge("RGBA", (r,g,b,a))
+    # Build card with mask background (same size as logo)
+    card = Image.new("RGBA", (new_w, new_h), (0,0,0,0))
 
-    out = Path("/tmp") / f"wm_{uuid.uuid4().hex}.png"
-    wm.save(out, "PNG")
+    if logo_key == "black":
+        # white translucent mask
+        mask_color = (255, 255, 255, percent_to_alpha255(MASK_ALPHA))
+    else:  # "white"
+        # black translucent mask
+        mask_color = (0, 0, 0, percent_to_alpha255(MASK_ALPHA))
+
+    mask_layer = Image.new("RGBA", (new_w, new_h), mask_color)
+    card.alpha_composite(mask_layer, (0,0))
+    card.alpha_composite(wm, (0,0))  # crisp logo on top
+
+    out = Path("/tmp") / f"card_{uuid.uuid4().hex}.png"
+    card.save(out, "PNG")
     return out
 
-def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
-    im = Image.open(src_path).convert("RGBA")
-    # target width = FIT_PCT * image width
-    target_w = max(1, int(im.width * FIT_PCT))
-    wm_path = build_logo_scaled(ensure_logo(wm_key), target_w, opacity_pct)
-    try:
-        wm = Image.open(wm_path).convert("RGBA")
-        x, y = compute_xy_for_position(im.width, im.height, wm.width, wm.height, pos_key)
-        base = Image.new("RGBA", im.size)
-        base = Image.alpha_composite(base, im)
-        base.alpha_composite(wm, (x, y))
-        base.convert("RGB").save(dst_path, "JPEG", quality=92)
-    finally:
-        Path(wm_path).unlink(missing_ok=True)
+# ====== IMAGE PROCESS ======
+def paste_watermark_pillow(src_path: Path, dst_path: Path, wm_key: str, pos_key: str):
+    # Work in RGBA and export PNG to keep quality
+    base = Image.open(src_path).convert("RGBA")
 
-def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pct: float, pos_key: str):
-    # Get video width with ffprobe
+    target_w = max(1, int(base.width * FIT_PCT))
+    card_path = build_card_scaled(ensure_logo(wm_key), target_w, wm_key)
+    try:
+        card = Image.open(card_path).convert("RGBA")
+        x, y = compute_xy_for_position(base.width, base.height, card.width, card.height, pos_key)
+
+        canvas = Image.new("RGBA", base.size)
+        canvas = Image.alpha_composite(canvas, base)
+        canvas.alpha_composite(card, (x, y))
+        # Save PNG (lossless) to avoid quality drop
+        canvas.save(dst_path, "PNG")
+    finally:
+        Path(card_path).unlink(missing_ok=True)
+
+# ====== VIDEO PROCESS (ffmpeg overlay card) ======
+def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, pos_key: str):
+    # probe width
     try:
         probe = subprocess.run(
             ["ffprobe","-v","error","-select_streams","v:0","-show_entries","stream=width","-of","csv=p=0", str(src_path)],
@@ -161,26 +174,27 @@ def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pc
         vid_w = int(probe.stdout.strip() or "0")
     except Exception:
         vid_w = 0
-
     video_w = vid_w if vid_w > 0 else 640
-    target_w = max(1, int(video_w * FIT_PCT))
-    wm_path = build_logo_scaled(ensure_logo(wm_key), target_w, opacity_pct)
 
-    # vertical position
+    target_w = max(1, int(video_w * FIT_PCT))
+    card_path = build_card_scaled(ensure_logo(wm_key), target_w, wm_key)
+
     if pos_key == "top":
-        overlay_y = str(BOTTOM_MARGIN)
+        overlay_y = str(VERT_MARGIN)
     elif pos_key == "mid":
         overlay_y = "(main_h-overlay_h)/2"
     else:
-        overlay_y = f"main_h-overlay_h-{BOTTOM_MARGIN}"
+        overlay_y = f"main_h-overlay_h-{VERT_MARGIN}"
 
     vf = f"[0][1]overlay=(main_w-overlay_w)/2:{overlay_y}"
+
     cmd = [
         "ffmpeg","-y",
         "-i", str(src_path),
-        "-i", str(wm_path),
+        "-i", str(card_path),
         "-filter_complex", vf,
-        "-c:v","libx264","-preset","veryfast","-crf","23",
+        # Higher quality encode to preserve overall sharpness
+        "-c:v","libx264","-preset","medium","-crf","20",
         "-c:a","copy",
         "-pix_fmt","yuv420p",
         "-movflags","+faststart",
@@ -189,7 +203,7 @@ def ffmpeg_overlay_video(src_path: Path, dst_path: Path, wm_key: str, opacity_pc
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     finally:
-        Path(wm_path).unlink(missing_ok=True)
+        Path(card_path).unlink(missing_ok=True)
 
 # ====== DONATIONS ======
 def qr_image_bytes(payload: str) -> BytesIO:
@@ -225,8 +239,7 @@ async def on_start(msg: Message):
         "1) Send an *image (≤2MB)* or *video (≤20MB)*.\n"
         "2) Choose watermark color: **White** or **Black**.\n"
         "3) Choose position: **Top / Middle / Bottom**.\n"
-        "4) Choose opacity (40/60/80% or Custom number).\n"
-        f"→ I’ll place the logo at ~{pct}% of the width, centered at your chosen position.\n\n"
+        f"→ I’ll place the logo at ~{pct}% width with a subtle contrast mask for readability.\n\n"
         "💸 /donate  ℹ️ /help  👤 /about  📊 /stats",
         parse_mode="Markdown"
     )
@@ -235,9 +248,9 @@ async def on_start(msg: Message):
 async def on_help(msg: Message):
     pct = int(FIT_PCT * 100)
     await msg.answer(
-        f"Watermark width ≈ {pct}% of media. Change with env `FIT_PCT` (e.g., 0.7).\n"
-        "Upscaling is on so it’s always visible; set `ALLOW_UPSCALE=false` to disable.\n"
-        "If video fails, try a smaller file or MP4.\n"
+        f"Watermark width ≈ {pct}% of media (change with env `FIT_PCT`, e.g., 0.70).\n"
+        f"Visibility mask opacity is set by `MASK_ALPHA` (default {MASK_ALPHA}).\n"
+        "Images are returned as PNG (lossless). Videos use CRF 20 for good quality.\n"
         "Commands: /start /help /donate /about"
     )
 
@@ -282,7 +295,7 @@ async def handle_image(msg: Message):
     await bot.download_file(f.file_path, destination=src)
     job_id = str(uuid.uuid4())
     PENDING[job_id] = {"user_id": msg.from_user.id, "type": "image", "src": src, "ts": time.time(),
-                       "logo": None, "pos": None, "opacity": None}
+                       "logo": None, "pos": None}
     await msg.reply("Choose watermark color:", reply_markup=job_logo_keyboard(job_id))
 
 @dp.message( (F.video) | (F.animation) )
@@ -296,18 +309,10 @@ async def handle_video(msg: Message):
     await bot.download_file(f.file_path, destination=src)
     job_id = str(uuid.uuid4())
     PENDING[job_id] = {"user_id": msg.from_user.id, "type": "video", "src": src, "ts": time.time(),
-                       "logo": None, "pos": None, "opacity": None}
+                       "logo": None, "pos": None}
     await msg.reply("Choose watermark color:", reply_markup=job_logo_keyboard(job_id))
 
-# position + opacity flow
-def job_position_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Top", callback_data=f"job:{job_id}:pos:top"),
-         InlineKeyboardButton(text="Middle", callback_data=f"job:{job_id}:pos:mid"),
-         InlineKeyboardButton(text="Bottom", callback_data=f"job:{job_id}:pos:bot")],
-        [InlineKeyboardButton(text="Cancel", callback_data=f"job:{job_id}:cancel")],
-    ])
-
+# Position flow
 @dp.callback_query(F.data.startswith("job:"))
 async def on_job_callback(cb: CallbackQuery):
     parts = cb.data.split(":")
@@ -342,40 +347,12 @@ async def on_job_callback(cb: CallbackQuery):
         if val not in ("top","mid","bot"):
             await cb.answer("Unknown position.", show_alert=True); return
         job["pos"] = val
-        await cb.message.edit_text("Choose opacity:", reply_markup=job_opacity_keyboard(job_id))
+        # Process immediately (no opacity step anymore)
+        await cb.message.edit_text("⏳ Processing…")
+        await process_and_send(bot, cb.message.chat.id, job_id, msg_to_edit=cb.message)
         await cb.answer(); return
 
-    if section == "op":
-        val = rest[0] if rest else None
-        if val in ("40","60","80"):
-            job["opacity"] = float(val)
-            await cb.answer("Opacity set.")
-            await process_and_send(bot, cb.message.chat.id, job_id, msg_to_edit=cb.message)
-            return
-        elif val == "custom":
-            WAITING[cb.from_user.id] = job_id
-            await cb.message.edit_text("Send a number between **10** and **100** (e.g., 65).", parse_mode="Markdown")
-            await cb.answer(); return
-
     await cb.answer("Unknown action.", show_alert=True)
-
-@dp.message(F.text)
-async def on_text(msg: Message):
-    job_id = WAITING.get(msg.from_user.id)
-    if not job_id: return
-    job = PENDING.get(job_id)
-    if not job:
-        WAITING.pop(msg.from_user.id, None); return
-
-    m = re.search(r"(\d{1,3})", msg.text.strip())
-    if not m: await msg.reply("Send a number like 65 (10–100)."); return
-    val = int(m.group(1))
-    if not 10 <= val <= 100:
-        await msg.reply("Value must be 10–100."); return
-
-    job["opacity"] = float(val)
-    WAITING.pop(msg.from_user.id, None)
-    await process_and_send(bot, msg.chat.id, job_id)
 
 # ====== PROCESSOR ======
 async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Optional[Message] = None):
@@ -389,24 +366,29 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
     if not job.get("pos"):
         if msg_to_edit: await msg_to_edit.edit_text("Pick a position (top/middle/bottom).")
         return
-    if job.get("opacity") is None:
-        if msg_to_edit: await msg_to_edit.edit_text("Pick an opacity.")
-        return
 
     src = job["src"]
-    dst = TMP_DIR / (f"{uuid.uuid4()}.mp4" if job["type"] == "video" else f"{uuid.uuid4()}.jpg")
-    if msg_to_edit:
-        try: await msg_to_edit.edit_text("⏳ Processing…")
-        except: pass
+    dst = TMP_DIR / (f"{uuid.uuid4()}.mp4" if job["type"] == "video" else f"{uuid.uuid4()}.png")
 
     try:
         if job["type"] == "image":
-            paste_watermark_pillow(src, dst, job["logo"], job["opacity"], job["pos"])
+            paste_watermark_pillow(src, dst, job["logo"], job["pos"])
             await bot.send_photo(chat_id, FSInputFile(dst), caption="✅ Watermarked")
         else:
-            ffmpeg_overlay_video(src, dst, job["logo"], job["opacity"], job["pos"])
+            ffmpeg_overlay_video(src, dst, job["logo"], job["pos"])
             await bot.send_video(chat_id, FSInputFile(dst), caption="✅ Watermarked")
-        await maybe_thank_and_prompt_donate(chat_id, job["user_id"])
+        # usage + donation nudge
+        uid = job["user_id"]
+        USAGE[str(uid)] = USAGE.get(str(uid), 0) + 1
+        save_usage(USAGE)
+        n = USAGE[str(uid)]
+        if n == 3 or (n > 3 and n % 5 == 0):
+            if WALLETS:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=coin, callback_data=f"donate:{coin}")]
+                    for coin in WALLETS.keys()
+                ])
+                await bot.send_message(chat_id, "🙏 If this bot helps, consider a small donation.", reply_markup=kb)
     except subprocess.CalledProcessError:
         if msg_to_edit: await msg_to_edit.edit_text("FFmpeg failed. Try a smaller/standard MP4.")
     except Exception as e:
@@ -422,8 +404,7 @@ async def process_and_send(bot: Bot, chat_id: int, job_id: str, msg_to_edit: Opt
 @dp.message(Command("stats"))
 async def on_stats(msg: Message):
     if ADMIN_ID and msg.from_user.id == ADMIN_ID:
-        total_users = len(USAGE)
-        total_jobs = sum(USAGE.values())
+        total_users = len(USAGE); total_jobs = sum(USAGE.values())
         top = sorted(USAGE.items(), key=lambda x: x[1], reverse=True)[:5]
         lines = [f"📊 Bot Stats", f"Users: {total_users}", f"Total Jobs: {total_jobs}", "Top users:"]
         for uid, cnt in top: lines.append(f"- {uid}: {cnt}")
